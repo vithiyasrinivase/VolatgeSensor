@@ -1,0 +1,337 @@
+<!-- Voltage Sensor Web Serial Interface
+     Save this file as voltage-sensor-web-serial.html and open it in a Chromium-based
+     browser (Chrome, Edge) that supports the Web Serial API. 
+
+     Requirements on the Arduino side:
+     - The Arduino sketch should print lines like: "Input Voltage = 3.45 V\n"
+     - Baud rate used by sketch: 9600 (change in UI if different)
+
+     Functionality:
+     - Connect / Disconnect to the Arduino over USB using Web Serial API
+     - Parse the voltage reading from Arduino's lines and show current value
+     - Live sparkline-style chart of recent readings
+     - Optional: calculate Vin from raw ADC if Arduino sends an ADC value (see README below)
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Voltage Sensor - Web Serial</title>
+  <style>
+    :root{--bg:#0f1724;--card:#111827;--muted:#93a0b3;--accent:#60a5fa;--ok:#34d399}
+    html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,'Helvetica Neue',Arial}
+    body{background:linear-gradient(180deg,#071029 0%, #0b1220 100%);color:#e6eef6;display:flex;align-items:center;justify-content:center;padding:20px}
+    .app{width:900px;max-width:98%;border-radius:12px;padding:18px;background:rgba(255,255,255,0.02);box-shadow:0 6px 30px rgba(2,6,23,0.7)}
+    .header{display:flex;gap:12px;align-items:center;margin-bottom:12px}
+    h1{font-size:20px;margin:0}
+    .controls{margin-left:auto;display:flex;gap:8px;align-items:center}
+    button{background:transparent;border:1px solid rgba(255,255,255,0.06);color:inherit;padding:8px 12px;border-radius:8px;cursor:pointer}
+    button.primary{background:linear-gradient(90deg,var(--accent),#4299e1);border:none;color:#04243a}
+    .status{font-size:13px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:1fr 340px;gap:12px}
+    .card{background:var(--card);padding:12px;border-radius:10px;box-shadow:inset 0 -1px 0 rgba(255,255,255,0.02)}
+
+    .big-value{font-size:36px;font-weight:700;letter-spacing:0.5px}
+    .meta{font-size:13px;color:var(--muted);margin-top:6px}
+    canvas{width:100%;height:160px;background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent);border-radius:8px}
+    .list{display:flex;flex-direction:column;gap:8px}
+    label{font-size:13px;color:var(--muted)}
+    input,select{padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
+    footer{margin-top:12px;color:var(--muted);font-size:13px}
+    .small{font-size:12px;color:var(--muted)}
+    .danger{color:#ff7b72}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="header">
+      <div>
+        <h1>Voltage Sensor — Web Serial Monitor</h1>
+        <div class="status" id="connStatus">Not connected</div>
+      </div>
+
+      <div class="controls">
+        <label for="baud" class="small">Baud</label>
+        <select id="baud">
+          <option>9600</option>
+          <option>115200</option>
+          <option>57600</option>
+        </select>
+        <button id="connectBtn" class="primary">Connect</button>
+        <button id="disconnectBtn" disabled>Disconnect</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <div class="big-value" id="voltageValue">— V</div>
+            <div class="meta">Parsed from Arduino output. Example line: <span class="small">Input Voltage = 3.45 V</span></div>
+          </div>
+          <div style="text-align:right">
+            <div class="small">Samples stored</div>
+            <div id="samplesCount" style="font-weight:700">0</div>
+          </div>
+        </div>
+
+        <div style="margin-top:12px">
+          <canvas id="chart" width="800" height="160"></canvas>
+        </div>
+
+        <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+          <button id="clearBtn">Clear</button>
+          <div class="small" style="margin-left:auto">Last raw line: <span id="lastLine" class="small">—</span></div>
+        </div>
+
+      </div>
+
+      <div class="card">
+        <div class="list">
+          <div>
+            <label>R1 (ohms)</label>
+            <input id="r1" value="37000">
+          </div>
+          <div>
+            <label>R2 (ohms)</label>
+            <input id="r2" value="6800">
+          </div>
+          <div>
+            <label>ADC Reference Voltage (V)</label>
+            <input id="vref" value="5.0">
+          </div>
+          <div>
+            <label>ADC Resolution (max value)</label>
+            <input id="adcMax" value="1023">
+          </div>
+
+          <div>
+            <label>Interpretation mode</label>
+            <select id="mode">
+              <option value="parse">Parse Arduino voltage text (recommended)</option>
+              <option value="adc">Parse raw ADC integer and compute Vin</option>
+            </select>
+          </div>
+
+          <div>
+            <label>Sample history length</label>
+            <input id="history" value="80">
+          </div>
+
+          <div style="display:flex;gap:8px;margin-top:6px">
+            <button id="exportBtn">Export CSV</button>
+            <button id="helpBtn">How to use</button>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      Make sure your Arduino prints voltage lines exactly like: <code>Input Voltage = 3.45 V</code> OR
+      prints a single integer ADC value per line if you choose "Parse raw ADC integer" mode.
+    </footer>
+  </div>
+
+  <script>
+    // UI elements
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const connStatus = document.getElementById('connStatus');
+    const voltageValue = document.getElementById('voltageValue');
+    const lastLineEl = document.getElementById('lastLine');
+    const samplesCount = document.getElementById('samplesCount');
+    const chartCanvas = document.getElementById('chart');
+    const clearBtn = document.getElementById('clearBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const helpBtn = document.getElementById('helpBtn');
+
+    // Settings
+    const r1Input = document.getElementById('r1');
+    const r2Input = document.getElementById('r2');
+    const vrefInput = document.getElementById('vref');
+    const adcMaxInput = document.getElementById('adcMax');
+    const modeSelect = document.getElementById('mode');
+    const historyInput = document.getElementById('history');
+    const baudSelect = document.getElementById('baud');
+
+    let port = null;
+    let reader = null;
+    let keepReading = false;
+    let textDecoder = null;
+
+    // Data buffer
+    let samples = [];
+
+    // Simple chart drawing
+    const ctx = chartCanvas.getContext('2d');
+    function drawChart(){
+      const w = chartCanvas.width = chartCanvas.clientWidth * devicePixelRatio;
+      const h = chartCanvas.height = chartCanvas.clientHeight * devicePixelRatio;
+      ctx.clearRect(0,0,w,h);
+      // background grid
+      ctx.globalAlpha = 0.06;
+      for(let i=0;i<6;i++){
+        const y = (i/5)*h;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0,y,w,1);
+      }
+      ctx.globalAlpha = 1;
+
+      if(samples.length===0) return;
+      const max = Math.max(...samples);
+      const min = Math.min(...samples);
+      const range = Math.max(0.0001, max-min);
+      ctx.beginPath();
+      samples.forEach((v,i)=>{
+        const x = (i/(samples.length-1||1))*w;
+        const y = h - ((v-min)/range) * h;
+        if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      });
+      ctx.lineWidth = 2 * devicePixelRatio;
+      ctx.strokeStyle = '#60a5fa';
+      ctx.stroke();
+    }
+
+    function updateUI(voltage, rawLine){
+      voltageValue.textContent = (voltage===null) ? '— V' : voltage.toFixed(3) + ' V';
+      lastLineEl.textContent = rawLine || '—';
+      samplesCount.textContent = samples.length;
+      drawChart();
+    }
+
+    function addSample(v){
+      const maxLen = Number(historyInput.value) || 80;
+      samples.push(v);
+      while(samples.length>maxLen) samples.shift();
+    }
+
+    clearBtn.addEventListener('click', ()=>{ samples = []; updateUI(null,'—'); });
+
+    exportBtn.addEventListener('click', ()=>{
+      if(samples.length===0){ alert('No samples to export'); return; }
+      const csv = 'index,voltage\n' + samples.map((v,i)=>`${i},${v}`).join('\n');
+      const blob = new Blob([csv],{type:'text/csv'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'voltage-samples.csv';
+      a.click(); URL.revokeObjectURL(url);
+    });
+
+    helpBtn.addEventListener('click', ()=>{
+      alert('How to use:\n1) Upload the Arduino sketch (prints lines like: Input Voltage = 3.45 V)\n2) Plug Arduino into USB\n3) Click Connect and choose the device, set the baud (default 9600)\n4) Watch live voltage and chart.\nIf your Arduino prints a raw ADC integer, switch to "Parse raw ADC integer" mode.');
+    });
+
+    async function connect(){
+      if(!('serial' in navigator)){
+        alert('Web Serial API not supported. Use Chrome, Edge or a Chromium-based browser.');
+        return;
+      }
+      try{
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: Number(baudSelect.value || 9600) });
+        connStatus.textContent = 'Connected';
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+
+        // Set up text stream reader
+        const decoder = new TextDecoderStream();
+        const inputDone = port.readable.pipeTo(decoder.writable);
+        const inputStream = decoder.readable;
+        reader = inputStream.getReader();
+        keepReading = true;
+        readLoop();
+      }catch(err){
+        console.error(err); alert('Connection failed: ' + err.message);
+      }
+    }
+
+    async function disconnect(){
+      keepReading = false;
+      try{
+        if(reader) { await reader.cancel(); reader = null; }
+        if(port){ await port.close(); port = null; }
+      }catch(e){ console.warn('Disconnect error', e); }
+      connStatus.textContent = 'Disconnected';
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+    }
+
+    async function readLoop(){
+      let partial = '';
+      while(keepReading && reader){
+        try{
+          const { value, done } = await reader.read();
+          if(done) break;
+          if(!value) continue;
+          // accumulate by line
+          partial += value;
+          const lines = partial.split(/\r?\n/);
+          partial = lines.pop(); // last partial line
+          for(const line of lines){
+            if(!line.trim()) continue;
+            handleLine(line.trim());
+          }
+        }catch(err){
+          console.error('Read error', err); break;
+        }
+      }
+      // cleanup state
+      disconnect();
+    }
+
+    function handleLine(line){
+      // Two modes:
+      // - parse textual voltage like: Input Voltage = 3.45 V
+      // - parse single integer ADC value like: 512
+      lastLineEl.textContent = line;
+
+      if(modeSelect.value === 'parse'){
+        // try to extract a floating number from the line
+        const m = line.match(/([+-]?[0-9]*\.?[0-9]+)\s*(?:V|v)?(?:$|\s)/);
+        if(m){
+          const val = parseFloat(m[1]);
+          if(!Number.isNaN(val)){
+            addSample(val);
+            updateUI(val, line);
+            return;
+          }
+        }
+        // not parsable
+        updateUI(null, line);
+      } else if(modeSelect.value === 'adc'){
+        // parse integer and compute Vin
+        const m = line.match(/(\d+)/);
+        if(m){
+          const adc = Number(m[1]);
+          const vref = Number(vrefInput.value) || 5.0;
+          const adcMax = Number(adcMaxInput.value) || 1023;
+          const r1 = Number(r1Input.value) || 37000;
+          const r2 = Number(r2Input.value) || 6800;
+          const vout = (adc / adcMax) * vref;
+          // Vin from divider: Vout = Vin * (R2/(R1+R2)) => Vin = Vout * (R1+R2)/R2
+          const vin = vout * ( (r1 + r2) / r2 );
+          addSample(vin);
+          updateUI(vin, line);
+          return;
+        }
+        updateUI(null, line);
+      }
+    }
+
+    connectBtn.addEventListener('click', connect);
+    disconnectBtn.addEventListener('click', disconnect);
+
+    // handle page hide/unload
+    window.addEventListener('beforeunload', async (e)=>{
+      if(port) await disconnect();
+    });
+
+    // resize observer for canvas redraw
+    new ResizeObserver(()=> drawChart()).observe(chartCanvas);
+
+  </script>
+</body>
+</html>
